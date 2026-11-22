@@ -1,132 +1,107 @@
-# VoxScribe — YouTube, Live Meeting & Local Video Transcriber
+# VoxScribe v3 — YouTube, Live Meeting & Local Video Transcriber
 
-Aplikasi web fullstack lokal untuk mengekstrak transkrip dari **video YouTube**, **rekaman Live Meeting** (Google Meet, Zoom, Microsoft Teams, Discord — baik versi Web maupun Aplikasi Desktop), serta **file video/audio lokal** (`.mp4`, `.webm`, `.mov`, `.mp3`, `.m4a`, `.wav`) secara gratis dan privat menggunakan **FastAPI** dan **faster-whisper**.
+Aplikasi web fullstack lokal berarsitektur modular untuk mengekstrak transkrip dari **video YouTube**, **rekaman Live Meeting** (Google Meet, Zoom, Microsoft Teams, Discord — baik versi Web maupun Aplikasi Desktop), serta **file video/audio lokal** secara gratis dan privat menggunakan **FastAPI**, **WebSocket**, **SQLite**, dan **faster-whisper**.
 
 ---
 
 ## Fitur Utama
 
-- **YouTube Video Transcriber**
-  - Mendukung link `youtube.com/watch?v=...`, `youtu.be/...`, `youtube.com/shorts/...`, `embed/`, dan `live/`.
-  - Prioritas subtitle **Bahasa Indonesia (`id`)** dengan fallback otomatis ke **Bahasa Inggris (`en`)**.
-  - Klik timestamp untuk langsung membuka detik terkait di YouTube.
-- **Live Meeting Recorder (Suara 2 Arah Bersih)**
-  - Menangkap suara **semua peserta meeting** (2 orang atau lebih) dari tab browser maupun audio sistem Windows + **mikrofon Anda**.
-  - Dilengkapi pemrosesan audio bersih di browser (*Echo Cancellation*, *Noise Suppression*, *Auto Gain Control*, *High-Pass/Low-Pass Filter*, dan *Dynamics Compressor*) serta **dual audio level meter** & slider **Gain Tab/Mic** real-time.
-  - Pilihan mode **Rekam Langsung (transkrip saat Stop)** yang ringan saat meeting, atau mode **Live Auto (~8 / ~15 detik)**.
-  - Transkrip diproses **100% lokal** dengan `faster-whisper` (otomatis memakai GPU CUDA jika tersedia, fallback mulus ke CPU `int8`).
+- **Workspace & Riwayat Transkrip (SQLite CRUD)**
+  - Semua hasil transkrip (YouTube, Live Meeting, Import Video) tersimpan otomatis di database SQLite (`data/voxscribe.db`) beserta rekaman audionya (`data/audio/`).
+  - **Sidebar Riwayat** dengan pencarian full-text lintas semua transkrip, filter kategori (*YouTube / Meeting / Video*), rename judul, serta tombol hapus.
+  - **Inline Edit Mode** langsung di halaman (baik di tab *Paragraf Bersih* maupun per baris *Timestamp*) untuk memperbaiki typo sebelum di-export.
+- **Pemisah Pembicara Otomatis (*Dual-Channel Speaker Separation*)**
+  - Saat merekam Live Meeting dengan Mikrofon aktif, suara **Mikrofon Anda** dan **Audio Tab/Sistem Meeting** direkam di 2 kanal stereo terpisah.
+  - Hasil transkrip otomatis diberi label dialog **`Anda`** (biru) dan **`Peserta`** (hijau) secara kronologis tanpa perlu model diarization tambahan.
+- **Live Meeting Recorder + Real-Time WebSocket**
+  - Menangkap suara semua peserta meeting (2 orang atau lebih) dari tab browser maupun audio sistem Windows + mikrofon Anda.
+  - Audio dibersihkan di browser (*Echo Cancellation*, *Noise Suppression*, *Auto Gain Control*, *High-Pass/Low-Pass Filter*, *Dynamics Compressor*) dengan **dual audio level meter** & slider **Gain Tab/Mic**.
+  - Pilihan **Rekam Langsung (transkrip saat Stop)** atau **Live Streaming via WebSocket (`/ws/transcribe`)** tiap ~8 / ~15 detik (dengan fallback HTTP otomatis).
+- **Interactive Transcript & Sync Audio Player**
+  - **Search & Highlight** kata kunci di dalam transkrip aktif lengkap dengan penghitung kecocokan.
+  - Klik timestamp mana saja untuk melompatkan audio player langsung ke detik tersebut (plus highlight baris aktif saat audio diputar).
 - **Import Video / Audio Lokal (Non-YouTube)**
-  - Langsung impor file video (`.mp4`, `.webm`, `.mov`, `.mkv`, `.m4v`) atau audio (`.mp3`, `.m4a`, `.wav`, `.ogg`) tanpa perlu install FFmpeg eksternal.
-  - Audio diekstrak di browser ke 16 kHz mono dan diproses bertahap per 30 detik agar video panjang tetap aman.
-- **Export Lengkap & UI Modern**
-  - Tampilan **Paragraf Bersih** dan **Dengan Timestamp**.
-  - **Copy Teks**, **Download `.TXT`**, **Export `.PDF`** (A4 rapi dengan header & nomor halaman), serta **Preview & Export Audio (`.WAV`)** untuk rekaman meeting/video.
-  - Mendukung **Dark Mode** dan **Light Mode**.
+  - Mendukung `.mp4`, `.webm`, `.mov`, `.mkv`, `.m4v`, `.mp3`, `.m4a`, `.wav`, `.ogg` tanpa FFmpeg eksternal (didekode langsung di browser lalu diproses per 30 detik).
+- **Export Multi-Format**
+  - **`.PDF`** (A4 rapi), **`.DOCX`** (Microsoft Word), **`.TXT`**, **`.SRT`** (subtitle CapCut/Premiere), **`.MD`** (Notion/Obsidian), dan **`.WAV`** (audio rekaman bersih).
 
 ---
 
 ## Tech Stack
 
-- **Backend:** Python, FastAPI, Uvicorn, Pydantic, `youtube-transcript-api`, `faster-whisper`, `numpy`
-- **Frontend:** HTML5, Tailwind CSS (CDN), Vanilla JavaScript, Web Audio API (`AudioWorklet`), jsPDF (CDN)
-
----
-
-## Prasyarat
-
-- **Python 3.10+** (disarankan Python 3.11 – 3.13; juga mendukung Python 3.15 dengan langkah instalasi khusus di bawah).
-- Browser **Google Chrome** atau **Microsoft Edge** (direkomendasikan untuk fitur tangkap audio tab/sistem `getDisplayMedia`).
+- **Backend:** Python, FastAPI, Uvicorn, WebSockets, SQLite (`sqlite3`), Pydantic, `youtube-transcript-api`, `faster-whisper`, `numpy`
+- **Frontend:** HTML5, Tailwind CSS (CDN), Vanilla JavaScript, Web Audio API (`AudioWorklet`, `ChannelMergerNode`), jsPDF (CDN)
+- **Testing & Container:** `pytest`, `httpx` (`TestClient`), Docker & Docker Compose
 
 ---
 
 ## Cara Instalasi & Menjalankan
 
-### 1. Clone Repository
+### Opsi 1 — Jalankan Lokal (Python `venv`)
+
+1. **Clone repository & masuk folder:**
+   ```bash
+   git clone https://github.com/arya27Q/web-transkrip-rekam-video-meet-zoom.git
+   cd web-transkrip-rekam-video-meet-zoom
+   ```
+
+2. **Buat & aktifkan virtual environment:**
+   ```powershell
+   # Windows PowerShell
+   python -m venv venv
+   .\venv\Scripts\Activate.ps1
+   ```
+   ```bash
+   # Linux / macOS
+   python3 -m venv venv
+   source venv/bin/activate
+   ```
+
+3. **Install dependencies:**
+   - **Python 3.10 – 3.13:**
+     ```bash
+     pip install -r requirements.txt
+     ```
+   - **Khusus Python 3.15 (Windows):**
+     ```powershell
+     pip install fastapi uvicorn websockets youtube-transcript-api pydantic python-multipart ctranslate2 huggingface-hub tokenizers numpy tqdm pytest httpx
+     pip install --no-deps faster-whisper
+     ```
+
+4. **Jalankan server:**
+   ```powershell
+   uvicorn main:app --reload
+   ```
+   *(Atau tanpa aktivasi `venv`: `.\venv\Scripts\uvicorn.exe main:app --reload`)*
+
+5. **Buka di Chrome / Edge:**
+   - Aplikasi Web: `http://127.0.0.1:8000`
+   - Dokumentasi API (Swagger): `http://127.0.0.1:8000/docs`
+
+### Opsi 2 — Jalankan dengan Docker Compose
 
 ```bash
-git clone https://github.com/arya27Q/web-transkrip-rekam-video-meet-zoom.git
-cd web-transkrip-rekam-video-meet-zoom
+docker compose up --build
 ```
-
-### 2. Buat & Aktifkan Virtual Environment (`venv`)
-
-**Windows (PowerShell):**
-```powershell
-python -m venv venv
-.\venv\Scripts\Activate.ps1
-```
-
-> Jika muncul error *Execution Policy* saat menjalankan `Activate.ps1`, jalankan sekali:
-> ```powershell
-> Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
-> ```
-
-**Linux / macOS:**
-```bash
-python3 -m venv venv
-source venv/bin/activate
-```
-
-### 3. Install Dependencies
-
-**Cara standar (Python 3.10 – 3.13):**
-```bash
-pip install -r requirements.txt
-```
-
-**Khusus Python 3.15 (Windows):**
-Karena beberapa dependency opsional (`av` / `onnxruntime`) belum menyediakan wheel Python 3.15 dan aplikasi ini memakai decoder WAV internal berbasis `numpy`, install paket inti dengan:
-```powershell
-pip install fastapi uvicorn youtube-transcript-api pydantic python-multipart ctranslate2 huggingface-hub tokenizers numpy tqdm
-pip install --no-deps faster-whisper
-```
-
-### 4. Jalankan Server Uvicorn
-
-Pastikan `venv` sudah aktif, lalu jalankan:
-```powershell
-uvicorn main:app --reload
-```
-
-*(Atau tanpa aktivasi `venv` di Windows PowerShell:)*
-```powershell
-.\venv\Scripts\uvicorn.exe main:app --reload
-```
-
-### 5. Buka Aplikasi di Browser
-
-Buka Chrome atau Edge lalu akses:
-- **Aplikasi Web:** `http://127.0.0.1:8000`
-- **Dokumentasi API (Swagger):** `http://127.0.0.1:8000/docs`
-
-> **Catatan:** Pada transkrip meeting/video **pertama kali**, `faster-whisper` akan mengunduh model Whisper yang dipilih (misalnya `small` ~460 MB) sekali saja ke cache lokal. Setelah itu seluruh proses berjalan lokal di PC Anda.
+Database SQLite, rekaman audio, dan cache model Whisper tersimpan persisten di volume Docker (`voxscribe_data` dan `voxscribe_hf_cache`).
 
 ---
 
-## Panduan Penggunaan
+## Menjalankan Automated Tests (`pytest`)
 
-### A. Transkrip Video YouTube
-1. Pilih tab **YouTube Video**.
-2. Tempelkan URL YouTube (`watch?v=...`, `youtu.be/...`, atau `shorts/...`), lalu klik **Transkrip**.
-3. Pilih tampilan **Paragraf Bersih** atau **Dengan Timestamp**, lalu **Copy Teks**, **Download .TXT**, atau **Export .PDF**.
+```powershell
+.\venv\Scripts\pytest.exe -v
+```
 
-### B. Rekam Live Meeting (Zoom, Google Meet, Microsoft Teams, Discord)
-1. Pilih tab **Live Meeting & Import Video**.
-2. Atur **Bahasa Transkrip**, **Model Whisper Lokal** (`Small` direkomendasikan untuk Bahasa Indonesia), dan **Mode Pemrosesan** (`Rekam Langsung` direkomendasikan).
-3. Klik **Mulai Rekam Meeting**:
-   - **Meeting via Browser** *(Google Meet, Zoom Web, Teams Web, Discord Web)*: pilih tab meeting → **centang `"Share tab audio"`**.
-   - **Aplikasi Desktop Windows** *(Zoom App, MS Teams App, Discord App, Meet App)*: pindah ke tab **Entire Screen (Seluruh Layar)** → **centang `"Also share system audio"`** *(jangan pilih tab "Window" karena opsi audio sistem hanya muncul di Entire Screen)*.
-4. Pastikan bar **Audio Meeting (Tab / Sistem)** dan **Mikrofon Anda** bergerak saat ada suara.
-5. Setelah meeting selesai, klik **Stop & Selesai**. Anda bisa memutar preview audio, mengunduh **Export Audio (`.WAV`)**, **Download `.TXT`**, dan **Export `.PDF`**.
+---
 
-**Tips Suara Bersih:**
-- Saat memakai mode *Entire Screen*, mute tab/aplikasi lain (notifikasi/musik) agar rekaman murni suara meeting.
-- Samakan perangkat **Speaker** pada aplikasi meeting dengan output audio default Windows Anda.
+## Panduan Rekam Meeting
 
-### C. Import Video / Audio Lokal (Non-YouTube)
-1. Di tab **Live Meeting & Import Video**, klik **Import Video / Audio**.
-2. Pilih file video (`.mp4`, `.webm`, `.mov`, `.mkv`) atau audio (`.mp3`, `.m4a`, `.wav`, `.ogg`).
-3. Tunggu proses ekstraksi & transkrip selesai, lalu export ke **`.PDF`**, **`.TXT`**, atau **`.WAV`**.
+- **Meeting via Browser (Web)** *(Google Meet, Zoom Web, MS Teams Web, Discord Web)*:
+  Klik **Mulai Rekam Meeting** → pilih tab meeting → **centang `"Share tab audio"`**.
+- **Aplikasi Desktop Windows** *(Zoom App, MS Teams App, Discord App, Meet App)*:
+  Klik **Mulai Rekam Meeting** → pindah ke tab **Entire Screen (Seluruh Layar)** → **centang `"Also share system audio"`** *(jangan pilih tab "Window")*.
+- **Tips Suara Bersih:** Mute notifikasi/tab lain saat mode *Entire Screen*, dan samakan perangkat Speaker di aplikasi meeting dengan output default Windows.
 
 ---
 
@@ -134,11 +109,21 @@ Buka Chrome atau Edge lalu akses:
 
 | Method | Endpoint | Deskripsi |
 | --- | --- | --- |
-| `GET` | `/` | Menyajikan halaman antarmuka web (`index.html`) |
+| `GET` | `/` | Halaman web **VoxScribe** (`index.html`) |
 | `GET` | `/health` | Cek status server backend |
-| `GET` | `/whisper-status` | Cek ketersediaan `faster-whisper`, model aktif, dan device (`cpu`/`cuda`) |
-| `POST` | `/transcribe` | Ekstrak transkrip dari link YouTube (`{"url": "..."}`) |
-| `POST` | `/transcribe-audio` | Transkrip file audio WAV 16 kHz mono dengan `faster-whisper` (`multipart/form-data`) |
+| `GET` | `/whisper-status` | Status model `faster-whisper` & device (`cpu`/`cuda`) |
+| `POST` | `/transcribe` | Transkrip video YouTube + simpan otomatis ke SQLite |
+| `POST` | `/transcribe-audio` | Transkrip WAV 16 kHz (mono / stereo dual-speaker) |
+| `WS` | `/ws/transcribe` | Streaming transkrip audio real-time via WebSocket |
+| `GET` | `/sessions` | Daftar & cari riwayat transkrip (`?q=...&source=...`) |
+| `POST` | `/sessions` | Simpan sesi transkrip baru ke SQLite |
+| `GET` | `/sessions/{id}` | Detail lengkap sesi transkrip |
+| `PATCH` | `/sessions/{id}` | Ubah judul atau simpan hasil edit transkrip |
+| `DELETE` | `/sessions/{id}` | Hapus sesi transkrip beserta audionya |
+| `POST/GET` | `/sessions/{id}/audio` | Simpan & putar/unduh file audio `.WAV` sesi |
+| `POST` | `/export/docx` | Export dokumen Microsoft Word (`.docx`) |
+| `POST` | `/export/srt` | Export file subtitle (`.srt`) |
+| `POST` | `/export/md` | Export dokumen Markdown (`.md`) |
 
 ---
 
@@ -146,17 +131,15 @@ Buka Chrome atau Edge lalu akses:
 
 ```text
 yt-transcribe-web/
-├── main.py            # Backend FastAPI (YouTube API + faster-whisper lokal)
-├── index.html         # Frontend single-file (Tailwind CSS + Web Audio API + jsPDF)
-├── requirements.txt   # Daftar library Python
-├── .gitignore         # File/folder yang diabaikan Git (venv, __pycache__, dll.)
-└── README.md          # Dokumentasi project
+├── main.py              # FastAPI app, REST & WebSocket routes
+├── database.py          # Layer database SQLite & penyimpanan audio
+├── audio_service.py     # Decoder WAV dual-channel, VAD, & faster-whisper engine
+├── exporters.py         # Generator export .DOCX, .SRT, dan .MD
+├── index.html           # Frontend SPA (Sidebar Riwayat, Editor, Dual-Speaker, Export)
+├── tests/
+│   └── test_app.py      # Automated test suite (pytest + FastAPI TestClient)
+├── Dockerfile           # Container image siap deploy
+├── docker-compose.yml   # Orkestrasi container + persistent volumes
+├── requirements.txt     # Daftar library Python
+└── README.md            # Dokumentasi project
 ```
-
----
-
-## Troubleshooting
-
-- **`uvicorn` tidak dikenali di PowerShell:** Pastikan `venv` sudah aktif (`.\venv\Scripts\Activate.ps1`) atau jalankan langsung lewat `.\venv\Scripts\uvicorn.exe main:app --reload`.
-- **Error audio tab tidak terdeteksi:** Pastikan kotak **"Share tab audio"** / **"Also share system audio"** dicentang pada popup berbagi layar Chrome/Edge.
-- **Browser tidak bisa akses mic/tab:** Pastikan mengakses aplikasi melalui `http://127.0.0.1:8000` atau `http://localhost:8000` (bukan lewat `file://`).

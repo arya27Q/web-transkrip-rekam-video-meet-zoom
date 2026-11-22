@@ -1,18 +1,21 @@
-import importlib.util
-import io
-import os
+import asyncio
+from contextlib import asynccontextmanager
 from pathlib import Path
 import re
-import sys
-import threading
-import types
 from typing import Annotated, Any
-import wave
 
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import (
+    FastAPI,
+    File,
+    Form,
+    HTTPException,
+    Query,
+    UploadFile,
+    WebSocket,
+    WebSocketDisconnect,
+)
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
-import numpy as np
+from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel, Field
 from youtube_transcript_api import YouTubeTranscriptApi
 from youtube_transcript_api._errors import (
@@ -27,30 +30,41 @@ from youtube_transcript_api._errors import (
     YouTubeTranscriptApiException,
 )
 
-# Kompatibilitas Python 3.15: faster-whisper mengimpor `av` di top-level audio.py,
-# padahal kita langsung meneruskan numpy float32 array 16 kHz dari decoder WAV internal.
-if importlib.util.find_spec("av") is None and "av" not in sys.modules:
-    sys.modules["av"] = types.ModuleType("av")
+from audio_service import (
+    ALLOWED_LANGUAGES,
+    ALLOWED_WHISPER_MODELS,
+    MAX_AUDIO_UPLOAD_BYTES,
+    WHISPER_AVAILABLE,
+    WHISPER_IMPORT_ERROR,
+    clean_snippet_text,
+    format_timestamp,
+    get_whisper_status,
+    transcribe_wav_bytes,
+)
+import database
+from exporters import build_docx_bytes, build_markdown, build_srt
 
-try:
-    import ctranslate2
-    from faster_whisper import WhisperModel
+BASE_DIR = Path(__file__).resolve().parent
 
-    WHISPER_AVAILABLE = True
-    WHISPER_IMPORT_ERROR: str | None = None
-except Exception as exc:  # pragma: no cover
-    ctranslate2 = None  # type: ignore[assignment]
-    WhisperModel = None  # type: ignore[assignment,misc]
-    WHISPER_AVAILABLE = False
-    WHISPER_IMPORT_ERROR = str(exc)
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    database.init_db()
+    yield
+
 
 app = FastAPI(
     title="VoxScribe API",
-    description="API lokal untuk mengekstrak transkrip video YouTube, live meeting (Zoom/Meet/Teams/Discord), dan file video/audio.",
-    version="2.0.0",
+    description=(
+        "API lokal untuk mengekstrak transkrip video YouTube, live meeting "
+        "(Zoom/Meet/Teams/Discord) dengan pemisah pembicara, file video/audio, "
+        "riwayat SQLite, WebSocket real-time, serta export DOCX/SRT/MD."
+    ),
+    version="3.0.0",
+    lifespan=lifespan,
 )
 
-# Izinkan semua origin agar bisa diakses langsung dari file HTML lokal (file://) maupun localhost
+# Izinkan semua origin agar bisa diakses dari localhost maupun file HTML lokal
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -59,40 +73,16 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-BASE_DIR = Path(__file__).resolve().parent
-
-# Regex untuk mengekstrak video_id (11 karakter) dari berbagai format URL YouTube
 YOUTUBE_URL_REGEX = re.compile(
     r"(?:https?://)?(?:www\.|m\.|music\.)?"
     r"(?:youtube\.com/(?:watch\?(?:[^#]*&)?v=|shorts/|embed/|live/)|youtu\.be/)"
     r"([A-Za-z0-9_-]{11})(?:[?&/#].*|$)"
 )
 
-ALLOWED_WHISPER_MODELS = {"tiny", "base", "small", "medium"}
-ALLOWED_LANGUAGES = {"id", "en", "auto"}
-LANGUAGE_NAMES = {
-    "id": "Indonesian",
-    "en": "English",
-    "ms": "Malay",
-    "ja": "Japanese",
-    "ko": "Korean",
-    "zh": "Chinese",
-}
-
-TARGET_SAMPLE_RATE = 16000
-MAX_AUDIO_UPLOAD_BYTES = 100 * 1024 * 1024  # 100 MB
-
-_whisper_lock = threading.Lock()
-_whisper_state: dict[str, Any] = {
-    "model": None,
-    "model_size": None,
-    "device": None,
-    "compute_type": None,
-}
-
 
 class TranscribeRequest(BaseModel):
     url: str = Field(..., min_length=1, description="URL video YouTube")
+    save: bool = Field(default=True, description="Simpan otomatis ke riwayat SQLite")
 
 
 class TimestampItem(BaseModel):
@@ -100,9 +90,11 @@ class TimestampItem(BaseModel):
     start: float
     duration: float
     text: str
+    speaker: str | None = None
 
 
 class TranscribeResponse(BaseModel):
+    session_id: str | None = None
     video_id: str
     language: str
     language_code: str
@@ -118,8 +110,41 @@ class AudioTranscribeResponse(BaseModel):
     language_code: str
     duration: float
     skipped_silence: bool
+    has_speakers: bool
     transcript: str
     timestamps: list[TimestampItem]
+
+
+class SessionCreateRequest(BaseModel):
+    title: str = Field(..., min_length=1)
+    source: str = Field(..., pattern="^(youtube|meeting|file)$")
+    source_ref: str = ""
+    language: str = "Indonesian"
+    language_code: str = "id"
+    model_size: str | None = None
+    device: str | None = None
+    is_generated: bool = False
+    has_speakers: bool = False
+    transcript: str = ""
+    timestamps: list[TimestampItem] = Field(default_factory=list)
+
+
+class SessionUpdateRequest(BaseModel):
+    title: str | None = None
+    transcript: str | None = None
+    timestamps: list[TimestampItem] | None = None
+
+
+class ExportRequest(BaseModel):
+    title: str = "Transkrip VoxScribe"
+    source: str = "meeting"
+    source_ref: str = ""
+    language: str = "Indonesian"
+    language_code: str = "id"
+    model_size: str | None = None
+    mode: str = Field(default="timestamps", pattern="^(paragraph|timestamps)$")
+    transcript: str = ""
+    timestamps: list[TimestampItem] = Field(default_factory=list)
 
 
 def extract_video_id(url: str) -> str:
@@ -135,21 +160,6 @@ def extract_video_id(url: str) -> str:
             ),
         )
     return match.group(1)
-
-
-def format_timestamp(seconds: float) -> str:
-    """Mengubah detik menjadi format MM:SS atau HH:MM:SS."""
-    total_seconds = max(0, int(seconds))
-    hours, remainder = divmod(total_seconds, 3600)
-    minutes, secs = divmod(remainder, 60)
-    if hours > 0:
-        return f"{hours:02d}:{minutes:02d}:{secs:02d}"
-    return f"{minutes:02d}:{secs:02d}"
-
-
-def clean_snippet_text(text: str) -> str:
-    """Membersihkan newline dan spasi berlebih dari potongan teks transkrip."""
-    return re.sub(r"\s+", " ", text.replace("\n", " ")).strip()
 
 
 def fetch_youtube_transcript(video_id: str, languages: list[str]) -> dict[str, Any]:
@@ -183,229 +193,14 @@ def fetch_youtube_transcript(video_id: str, languages: list[str]) -> dict[str, A
     }
 
 
-def decode_wav_to_float32_16k(wav_bytes: bytes) -> tuple[np.ndarray, float]:
-    """
-    Mendekode file WAV PCM menjadi array float32 mono 16 kHz untuk faster-whisper
-    tanpa memerlukan FFmpeg eksternal.
-    """
-    try:
-        with wave.open(io.BytesIO(wav_bytes), "rb") as wf:
-            channels = wf.getnchannels()
-            sample_width = wf.getsampwidth()
-            sample_rate = wf.getframerate()
-            frame_count = wf.getnframes()
-            raw_frames = wf.readframes(frame_count)
-    except wave.Error as exc:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Format audio WAV tidak valid: {exc}",
-        ) from exc
-
-    if frame_count == 0 or not raw_frames:
-        return np.zeros(0, dtype=np.float32), 0.0
-
-    if sample_width == 2:
-        samples = np.frombuffer(raw_frames, dtype=np.int16).astype(np.float32) / 32768.0
-    elif sample_width == 4:
-        samples = np.frombuffer(raw_frames, dtype=np.int32).astype(np.float32) / 2147483648.0
-    elif sample_width == 1:
-        samples = (np.frombuffer(raw_frames, dtype=np.uint8).astype(np.float32) - 128.0) / 128.0
-    else:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Bit depth WAV ({sample_width * 8}-bit) tidak didukung. Gunakan PCM 16-bit.",
-        )
-
-    if channels > 1:
-        usable_len = (len(samples) // channels) * channels
-        samples = samples[:usable_len].reshape(-1, channels).mean(axis=1)
-
-    duration_sec = len(samples) / float(sample_rate) if sample_rate > 0 else 0.0
-
-    if sample_rate != TARGET_SAMPLE_RATE and len(samples) > 1:
-        target_len = max(1, int(round(len(samples) * TARGET_SAMPLE_RATE / sample_rate)))
-        old_idx = np.linspace(0.0, len(samples) - 1, num=len(samples), dtype=np.float64)
-        new_idx = np.linspace(0.0, len(samples) - 1, num=target_len, dtype=np.float64)
-        samples = np.interp(new_idx, old_idx, samples).astype(np.float32)
-
-    return np.ascontiguousarray(samples, dtype=np.float32), duration_sec
+def _safe_filename(name: str, fallback: str = "transkrip") -> str:
+    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "-", name).strip("-.")
+    return cleaned[:80] or fallback
 
 
-def preprocess_speech_audio(audio: np.ndarray) -> tuple[np.ndarray, float]:
-    """
-    Membersihkan audio sebelum masuk ke Whisper:
-    - Hapus DC offset
-    - Deteksi & pangkas bagian hening awal/akhir (energy-based VAD agar tidak halusinasi)
-    - Normalisasi volume lembut agar suara kecil tetap terdengar jelas tanpa mengangkat noise
-    Mengembalikan (audio_bersih, leading_trim_seconds).
-    """
-    if audio.size < int(TARGET_SAMPLE_RATE * 0.2):
-        return np.zeros(0, dtype=np.float32), 0.0
-
-    audio = audio - float(np.mean(audio))
-
-    overall_rms = float(np.sqrt(np.mean(audio * audio)))
-    if overall_rms < 0.0025:
-        return np.zeros(0, dtype=np.float32), 0.0
-
-    # Analisis energi per frame 30ms untuk memangkas hening awal/akhir
-    frame_size = int(TARGET_SAMPLE_RATE * 0.03)
-    num_frames = len(audio) // frame_size
-    leading_trim_sec = 0.0
-
-    if num_frames > 0:
-        framed = audio[: num_frames * frame_size].reshape(num_frames, frame_size)
-        frame_rms = np.sqrt(np.mean(framed * framed, axis=1))
-        noise_floor = float(np.percentile(frame_rms, 15))
-        speech_threshold = max(0.0045, noise_floor * 2.2)
-
-        active = np.where(frame_rms >= speech_threshold)[0]
-        if active.size == 0:
-            return np.zeros(0, dtype=np.float32), 0.0
-
-        pad_frames = 8  # ~240ms padding di awal & akhir ucapan
-        start_frame = max(0, int(active[0]) - pad_frames)
-        end_frame = min(num_frames, int(active[-1]) + pad_frames + 1)
-
-        start_sample = start_frame * frame_size
-        end_sample = min(len(audio), end_frame * frame_size)
-        audio = audio[start_sample:end_sample]
-        leading_trim_sec = start_sample / float(TARGET_SAMPLE_RATE)
-
-    peak = float(np.max(np.abs(audio))) if audio.size > 0 else 0.0
-    if peak > 1e-4:
-        # Target peak 0.75 dengan batas gain maksimal 5x agar background hiss tidak ikut naik
-        gain = min(0.75 / peak, 5.0)
-        audio = np.clip(audio * gain, -1.0, 1.0)
-
-    return np.ascontiguousarray(audio, dtype=np.float32), leading_trim_sec
-
-
-def _load_whisper_model_unlocked(model_size: str, force_cpu: bool = False) -> tuple[Any, str, str]:
-    """Memuat model faster-whisper (mencoba CUDA lebih dulu, otomatis fallback ke CPU int8)."""
-    if not WHISPER_AVAILABLE or WhisperModel is None:
-        raise HTTPException(
-            status_code=500,
-            detail=f"faster-whisper belum siap di server: {WHISPER_IMPORT_ERROR}",
-        )
-
-    if (
-        not force_cpu
-        and _whisper_state["model"] is not None
-        and _whisper_state["model_size"] == model_size
-    ):
-        return (
-            _whisper_state["model"],
-            _whisper_state["device"],
-            _whisper_state["compute_type"],
-        )
-
-    if (
-        force_cpu
-        and _whisper_state["model"] is not None
-        and _whisper_state["model_size"] == model_size
-        and _whisper_state["device"] == "cpu"
-    ):
-        return (
-            _whisper_state["model"],
-            _whisper_state["device"],
-            _whisper_state["compute_type"],
-        )
-
-    cpu_threads = max(2, min(8, os.cpu_count() or 4))
-
-    if not force_cpu and ctranslate2 is not None and ctranslate2.get_cuda_device_count() > 0:
-        try:
-            model = WhisperModel(model_size, device="cuda", compute_type="float16")
-            _whisper_state.update(
-                {
-                    "model": model,
-                    "model_size": model_size,
-                    "device": "cuda",
-                    "compute_type": "float16",
-                }
-            )
-            return model, "cuda", "float16"
-        except Exception:
-            pass
-
-    model = WhisperModel(
-        model_size,
-        device="cpu",
-        compute_type="int8",
-        cpu_threads=cpu_threads,
-    )
-    _whisper_state.update(
-        {
-            "model": model,
-            "model_size": model_size,
-            "device": "cpu",
-            "compute_type": "int8",
-        }
-    )
-    return model, "cpu", "int8"
-
-
-def run_whisper_transcription(
-    audio_np: np.ndarray,
-    language: str,
-    model_size: str,
-    leading_trim_sec: float,
-    offset_seconds: float,
-) -> tuple[list[TimestampItem], str, str, str]:
-    """Menjalankan inferensi faster-whisper secara thread-safe dengan fallback otomatis ke CPU."""
-    lang_arg = None if language == "auto" else language
-
-    with _whisper_lock:
-        model, device, _ = _load_whisper_model_unlocked(model_size, force_cpu=False)
-
-        def _do_transcribe(active_model: Any) -> tuple[list[Any], Any]:
-            segments_gen, info = active_model.transcribe(
-                audio_np,
-                language=lang_arg,
-                beam_size=5,
-                vad_filter=False,
-                condition_on_previous_text=False,
-                no_speech_threshold=0.6,
-                log_prob_threshold=-1.0,
-                compression_ratio_threshold=2.4,
-            )
-            return list(segments_gen), info
-
-        try:
-            raw_segments, info = _do_transcribe(model)
-        except Exception as exc:
-            # Jika CUDA gagal saat runtime (misalnya cublas/cudnn DLL tidak ditemukan), fallback ke CPU
-            if device == "cuda":
-                model, device, _ = _load_whisper_model_unlocked(model_size, force_cpu=True)
-                raw_segments, info = _do_transcribe(model)
-            else:
-                raise exc
-
-    timestamps: list[TimestampItem] = []
-    for seg in raw_segments:
-        if getattr(seg, "no_speech_prob", 0.0) > 0.78:
-            continue
-        cleaned = clean_snippet_text(str(seg.text))
-        if not cleaned:
-            continue
-
-        abs_start = max(0.0, offset_seconds + leading_trim_sec + float(seg.start))
-        duration = max(0.0, float(seg.end) - float(seg.start))
-        timestamps.append(
-            TimestampItem(
-                timestamp=format_timestamp(abs_start),
-                start=round(abs_start, 2),
-                duration=round(duration, 2),
-                text=cleaned,
-            )
-        )
-
-    detected_code = getattr(info, "language", None) or (language if language != "auto" else "id")
-    detected_name = LANGUAGE_NAMES.get(detected_code, detected_code.upper())
-    return timestamps, detected_code, detected_name, device
-
-
+# =====================================================================
+# Frontend & Health Routes
+# =====================================================================
 @app.get("/", include_in_schema=False)
 def serve_frontend() -> FileResponse:
     return FileResponse(BASE_DIR / "index.html", media_type="text/html")
@@ -413,21 +208,17 @@ def serve_frontend() -> FileResponse:
 
 @app.get("/health")
 def health_check() -> dict[str, str]:
-    return {"status": "ok", "message": "YouTube & Live Meeting Transcribe API siap digunakan."}
+    return {"status": "ok", "message": "VoxScribe API v3 siap digunakan."}
 
 
 @app.get("/whisper-status")
 def whisper_status() -> dict[str, Any]:
-    return {
-        "available": WHISPER_AVAILABLE,
-        "error": WHISPER_IMPORT_ERROR,
-        "loaded_model": _whisper_state["model_size"],
-        "device": _whisper_state["device"],
-        "compute_type": _whisper_state["compute_type"],
-        "supported_models": sorted(ALLOWED_WHISPER_MODELS),
-    }
+    return get_whisper_status()
 
 
+# =====================================================================
+# YouTube Transcription Endpoint
+# =====================================================================
 @app.post("/transcribe", response_model=TranscribeResponse)
 def transcribe_video(payload: TranscribeRequest) -> TranscribeResponse:
     video_id = extract_video_id(payload.url)
@@ -435,10 +226,7 @@ def transcribe_video(payload: TranscribeRequest) -> TranscribeResponse:
     try:
         result = fetch_youtube_transcript(video_id, languages=["id", "en"])
     except InvalidVideoId as exc:
-        raise HTTPException(
-            status_code=400,
-            detail="ID video YouTube tidak valid.",
-        ) from exc
+        raise HTTPException(status_code=400, detail="ID video YouTube tidak valid.") from exc
     except TranscriptsDisabled as exc:
         raise HTTPException(
             status_code=404,
@@ -499,7 +287,23 @@ def transcribe_video(payload: TranscribeRequest) -> TranscribeResponse:
 
     full_paragraph = re.sub(r"\s+", " ", " ".join(text_parts)).strip()
 
+    session_id: str | None = None
+    if payload.save:
+        database.init_db()
+        saved = database.create_session(
+            title=f"YouTube: {video_id}",
+            source="youtube",
+            source_ref=video_id,
+            language=result["language"],
+            language_code=result["language_code"],
+            is_generated=result["is_generated"],
+            transcript=full_paragraph,
+            timestamps=[t.model_dump() for t in timestamps],
+        )
+        session_id = saved["id"]
+
     return TranscribeResponse(
+        session_id=session_id,
         video_id=video_id,
         language=result["language"],
         language_code=result["language_code"],
@@ -509,12 +313,16 @@ def transcribe_video(payload: TranscribeRequest) -> TranscribeResponse:
     )
 
 
+# =====================================================================
+# Audio Transcription (HTTP + Dual-Channel Speaker Separation)
+# =====================================================================
 @app.post("/transcribe-audio", response_model=AudioTranscribeResponse)
 def transcribe_audio(
-    file: Annotated[UploadFile, File(description="File audio WAV PCM (16 kHz mono)")],
+    file: Annotated[UploadFile, File(description="File audio WAV PCM 16 kHz (mono atau stereo dual-speaker)")],
     language: Annotated[str, Form()] = "id",
     model_size: Annotated[str, Form()] = "small",
     offset_seconds: Annotated[float, Form()] = 0.0,
+    speaker_mode: Annotated[str, Form()] = "auto",
 ) -> AudioTranscribeResponse:
     if not WHISPER_AVAILABLE:
         raise HTTPException(
@@ -524,6 +332,7 @@ def transcribe_audio(
 
     language = language.strip().lower()
     model_size = model_size.strip().lower()
+    speaker_mode = speaker_mode.strip().lower()
 
     if language not in ALLOWED_LANGUAGES:
         raise HTTPException(
@@ -535,6 +344,8 @@ def transcribe_audio(
             status_code=400,
             detail=f"Model Whisper tidak valid. Pilih salah satu: {', '.join(sorted(ALLOWED_WHISPER_MODELS))}.",
         )
+    if speaker_mode not in {"auto", "mono", "dual", "remote_only"}:
+        raise HTTPException(status_code=400, detail="speaker_mode tidak valid.")
 
     wav_bytes = file.file.read(MAX_AUDIO_UPLOAD_BYTES + 1)
     if not wav_bytes:
@@ -542,47 +353,265 @@ def transcribe_audio(
     if len(wav_bytes) > MAX_AUDIO_UPLOAD_BYTES:
         raise HTTPException(status_code=413, detail="Ukuran file audio melebihi batas 100 MB.")
 
-    audio_np, duration_sec = decode_wav_to_float32_16k(wav_bytes)
-    clean_audio, leading_trim_sec = preprocess_speech_audio(audio_np)
-
-    if clean_audio.size == 0:
-        lang_code = language if language != "auto" else "id"
-        return AudioTranscribeResponse(
-            model_size=model_size,
-            device=_whisper_state["device"] or "cpu",
-            language=LANGUAGE_NAMES.get(lang_code, lang_code.upper()),
-            language_code=lang_code,
-            duration=round(duration_sec, 2),
-            skipped_silence=True,
-            transcript="",
-            timestamps=[],
-        )
-
     try:
-        timestamps, detected_code, detected_name, device = run_whisper_transcription(
-            audio_np=clean_audio,
+        result = transcribe_wav_bytes(
+            wav_bytes,
             language=language,
             model_size=model_size,
-            leading_trim_sec=leading_trim_sec,
-            offset_seconds=max(0.0, offset_seconds),
+            offset_seconds=offset_seconds,
+            speaker_mode=speaker_mode,
         )
-    except HTTPException:
-        raise
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(
             status_code=500,
             detail=f"Gagal mentranskrip audio dengan faster-whisper: {exc}",
         ) from exc
 
-    full_paragraph = re.sub(r"\s+", " ", " ".join(item.text for item in timestamps)).strip()
+    return AudioTranscribeResponse(**result)
 
-    return AudioTranscribeResponse(
-        model_size=model_size,
-        device=device,
-        language=detected_name,
-        language_code=detected_code,
-        duration=round(duration_sec, 2),
-        skipped_silence=len(timestamps) == 0,
-        transcript=full_paragraph,
-        timestamps=timestamps,
+
+# =====================================================================
+# Real-Time WebSocket Streaming Transcription (/ws/transcribe)
+# =====================================================================
+@app.websocket("/ws/transcribe")
+async def websocket_transcribe(websocket: WebSocket) -> None:
+    """
+    Protokol streaming audio Live Meeting:
+    1. Client kirim JSON metadata:
+       {"type": "chunk", "language": "id", "model_size": "small", "offset_seconds": 8.0, "speaker_mode": "dual"}
+    2. Client kirim binary frame WAV PCM 16 kHz.
+    3. Server balas JSON {"type": "result", ...} atau {"type": "error", "detail": "..."}.
+    """
+    await websocket.accept()
+    config: dict[str, Any] = {
+        "language": "id",
+        "model_size": "small",
+        "offset_seconds": 0.0,
+        "speaker_mode": "auto",
+    }
+
+    await websocket.send_json(
+        {
+            "type": "ready",
+            "whisper_available": WHISPER_AVAILABLE,
+        }
+    )
+
+    try:
+        while True:
+            message = await websocket.receive()
+            if message["type"] == "websocket.disconnect":
+                break
+
+            if "text" in message and message["text"] is not None:
+                import json
+
+                try:
+                    meta = json.loads(message["text"])
+                except json.JSONDecodeError:
+                    await websocket.send_json({"type": "error", "detail": "Payload JSON tidak valid."})
+                    continue
+
+                if meta.get("type") == "ping":
+                    await websocket.send_json({"type": "pong"})
+                    continue
+
+                if "language" in meta and str(meta["language"]).lower() in ALLOWED_LANGUAGES:
+                    config["language"] = str(meta["language"]).lower()
+                if "model_size" in meta and str(meta["model_size"]).lower() in ALLOWED_WHISPER_MODELS:
+                    config["model_size"] = str(meta["model_size"]).lower()
+                if "offset_seconds" in meta:
+                    config["offset_seconds"] = max(0.0, float(meta["offset_seconds"]))
+                if "speaker_mode" in meta and str(meta["speaker_mode"]).lower() in {
+                    "auto",
+                    "mono",
+                    "dual",
+                    "remote_only",
+                }:
+                    config["speaker_mode"] = str(meta["speaker_mode"]).lower()
+
+            elif "bytes" in message and message["bytes"] is not None:
+                wav_bytes = message["bytes"]
+                if not wav_bytes:
+                    continue
+                if len(wav_bytes) > MAX_AUDIO_UPLOAD_BYTES:
+                    await websocket.send_json(
+                        {"type": "error", "detail": "Ukuran segmen audio melebihi batas."}
+                    )
+                    continue
+
+                try:
+                    result = await asyncio.to_thread(
+                        transcribe_wav_bytes,
+                        wav_bytes,
+                        language=config["language"],
+                        model_size=config["model_size"],
+                        offset_seconds=config["offset_seconds"],
+                        speaker_mode=config["speaker_mode"],
+                    )
+                    await websocket.send_json({"type": "result", **result})
+                except Exception as exc:
+                    await websocket.send_json(
+                        {"type": "error", "detail": f"Gagal memproses segmen audio: {exc}"}
+                    )
+    except WebSocketDisconnect:
+        return
+
+
+# =====================================================================
+# SQLite Session Workspace CRUD (/sessions)
+# =====================================================================
+@app.get("/sessions")
+def list_saved_sessions(
+    q: Annotated[str | None, Query(description="Kata kunci pencarian lintas transkrip")] = None,
+    source: Annotated[str | None, Query(description="Filter: youtube, meeting, file")] = None,
+    limit: Annotated[int, Query(ge=1, le=500)] = 100,
+) -> dict[str, Any]:
+    database.init_db()
+    items = database.list_sessions(q=q, source=source, limit=limit)
+    return {"items": items, "total": len(items)}
+
+
+@app.post("/sessions", status_code=201)
+def create_saved_session(payload: SessionCreateRequest) -> dict[str, Any]:
+    database.init_db()
+    return database.create_session(
+        title=payload.title,
+        source=payload.source,
+        source_ref=payload.source_ref,
+        language=payload.language,
+        language_code=payload.language_code,
+        model_size=payload.model_size,
+        device=payload.device,
+        is_generated=payload.is_generated,
+        has_speakers=payload.has_speakers,
+        transcript=payload.transcript,
+        timestamps=[t.model_dump() for t in payload.timestamps],
+    )
+
+
+@app.get("/sessions/{session_id}")
+def get_saved_session(session_id: str) -> dict[str, Any]:
+    database.init_db()
+    session = database.get_session(session_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail="Riwayat transkrip tidak ditemukan.")
+    return session
+
+
+@app.patch("/sessions/{session_id}")
+def update_saved_session(session_id: str, payload: SessionUpdateRequest) -> dict[str, Any]:
+    database.init_db()
+    updated = database.update_session(
+        session_id,
+        title=payload.title,
+        transcript=payload.transcript,
+        timestamps=[t.model_dump() for t in payload.timestamps]
+        if payload.timestamps is not None
+        else None,
+    )
+    if updated is None:
+        raise HTTPException(status_code=404, detail="Riwayat transkrip tidak ditemukan.")
+    return updated
+
+
+@app.delete("/sessions/{session_id}")
+def delete_saved_session(session_id: str) -> dict[str, Any]:
+    database.init_db()
+    deleted = database.delete_session(session_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Riwayat transkrip tidak ditemukan.")
+    return {"deleted": True, "id": session_id}
+
+
+@app.post("/sessions/{session_id}/audio")
+def upload_session_audio(
+    session_id: str,
+    file: Annotated[UploadFile, File(description="Rekaman audio WAV sesi")],
+) -> dict[str, Any]:
+    database.init_db()
+    wav_bytes = file.file.read(MAX_AUDIO_UPLOAD_BYTES + 1)
+    if not wav_bytes:
+        raise HTTPException(status_code=400, detail="File audio kosong.")
+    if len(wav_bytes) > MAX_AUDIO_UPLOAD_BYTES:
+        raise HTTPException(status_code=413, detail="Ukuran audio melebihi batas 100 MB.")
+
+    updated = database.save_session_audio(session_id, wav_bytes)
+    if updated is None:
+        raise HTTPException(status_code=404, detail="Riwayat transkrip tidak ditemukan.")
+    return updated
+
+
+@app.get("/sessions/{session_id}/audio")
+def get_session_audio(session_id: str) -> FileResponse:
+    database.init_db()
+    audio_path = database.get_session_audio_path(session_id)
+    if audio_path is None:
+        raise HTTPException(status_code=404, detail="Audio untuk sesi ini tidak tersedia.")
+    return FileResponse(
+        audio_path,
+        media_type="audio/wav",
+        filename=f"voxscribe-{session_id}.wav",
+    )
+
+
+# =====================================================================
+# Multi-Format Export Endpoints (.DOCX, .SRT, .MD)
+# =====================================================================
+@app.post("/export/docx")
+def export_docx(payload: ExportRequest) -> Response:
+    subtitle = (
+        f"Link: https://www.youtube.com/watch?v={payload.source_ref}"
+        if payload.source == "youtube" and payload.source_ref
+        else f"Sumber: {payload.source.upper()} ({payload.source_ref or '-'})"
+        + (f"  |  Model: faster-whisper ({payload.model_size})" if payload.model_size else "")
+    )
+    mode_label = "Dengan Timestamp" if payload.mode == "timestamps" else "Paragraf Bersih"
+    meta_line = f"Bahasa: {payload.language} ({payload.language_code})  |  Mode: {mode_label}"
+
+    docx_bytes = build_docx_bytes(
+        title=payload.title,
+        subtitle=subtitle,
+        meta_line=meta_line,
+        transcript=payload.transcript,
+        timestamps=[t.model_dump() for t in payload.timestamps],
+        mode=payload.mode,
+    )
+    fname = _safe_filename(payload.title, "voxscribe")
+    return Response(
+        content=docx_bytes,
+        media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        headers={"Content-Disposition": f'attachment; filename="{fname}.docx"'},
+    )
+
+
+@app.post("/export/srt")
+def export_srt(payload: ExportRequest) -> Response:
+    srt_text = build_srt([t.model_dump() for t in payload.timestamps])
+    fname = _safe_filename(payload.title, "voxscribe")
+    return Response(
+        content=srt_text.encode("utf-8"),
+        media_type="text/plain; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{fname}.srt"'},
+    )
+
+
+@app.post("/export/md")
+def export_markdown(payload: ExportRequest) -> Response:
+    md_text = build_markdown(
+        title=payload.title,
+        source=payload.source,
+        source_ref=payload.source_ref,
+        language=payload.language,
+        language_code=payload.language_code,
+        transcript=payload.transcript,
+        timestamps=[t.model_dump() for t in payload.timestamps],
+    )
+    fname = _safe_filename(payload.title, "voxscribe")
+    return Response(
+        content=md_text.encode("utf-8"),
+        media_type="text/markdown; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{fname}.md"'},
     )

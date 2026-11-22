@@ -1,0 +1,17 @@
+services:
+  voxscribe:
+    build: .
+    container_name: voxscribe
+    ports:
+      - "8000:8000"
+    environment:
+      - VOXSCRIBE_DATA_DIR=/app/data
+      - HF_HOME=/app/hf_cache
+    volumes:
+      - voxscribe_data:/app/data
+      - voxscribe_hf_cache:/app/hf_cache
+    restart: unless-stopped
+
+volumes:
+  voxscribe_data:
+  voxscribe_hf_cache:

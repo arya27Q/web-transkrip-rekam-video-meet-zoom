@@ -2,6 +2,9 @@ venv/
 .venv/
 __pycache__/
 *.py[cod]
+.pytest_cache/
+data/
+*.db
 .env
 .DS_Store
 Thumbs.db
